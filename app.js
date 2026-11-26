@@ -76,7 +76,6 @@
     const fail = [];
 
     try {
-      // Avoid browser blocking many downloads: small gap between saves
       for (let i = 0; i < selected.length; i++) {
         const item = selected[i];
         setStatus(`OCR ${i + 1}/${selected.length}: ${item.file.name}`);
@@ -91,6 +90,7 @@
           setStatus(
             `PDF ${i + 1}/${selected.length}: Համար ${hamar} → ${filename}`
           );
+          // PDF = original photo unchanged
           await makeSinglePdf(item.dataUrl, filename);
           ok.push({ filename, hamar, last4 });
           await sleep(350);
@@ -117,7 +117,6 @@
     }
   }
 
-  /** If two invoices share same last4, use 2815.pdf, 2815_2.pdf, … */
   function uniqueFilename(last4, alreadyOk) {
     const used = new Set(alreadyOk.map((r) => r.filename));
     let name = `${last4}.pdf`;
@@ -142,39 +141,161 @@
     });
   }
 
+  /**
+   * Find 10-digit Համար (also printed as A7627426960 / B0897354074 in corner).
+   * Tries crops + rotations; does not alter the photo used for PDF.
+   */
   async function extractHamar(dataUrl, index, total) {
+    const img = await loadImage(dataUrl);
+    const variants = buildOcrVariants(img);
+
+    for (let v = 0; v < variants.length; v++) {
+      setStatus(`OCR ${index}/${total}: вариант ${v + 1}/${variants.length}`);
+      const text = await ocrDigits(variants[v], index, total, v + 1, variants.length);
+      const hamar = pickHamarFromText(text);
+      if (hamar) return hamar;
+    }
+    return null;
+  }
+
+  function buildOcrVariants(img) {
+    const out = [];
+    // Full + top band (serial / [3] Համար live at top)
+    const sources = [
+      { sx: 0, sy: 0, sw: img.width, sh: img.height, label: 'full' },
+      { sx: 0, sy: 0, sw: img.width, sh: Math.floor(img.height * 0.28), label: 'top' },
+      {
+        sx: Math.floor(img.width * 0.45),
+        sy: 0,
+        sw: Math.floor(img.width * 0.55),
+        sh: Math.floor(img.height * 0.22),
+        label: 'top-right',
+      },
+    ];
+
+    for (const src of sources) {
+      for (const deg of [0, 90, 270, 180]) {
+        out.push(renderVariant(img, src, deg, 2.2));
+      }
+    }
+    return out;
+  }
+
+  function renderVariant(img, src, deg, scale) {
+    const sw = Math.max(1, src.sw);
+    const sh = Math.max(1, src.sh);
+    const rad = (deg * Math.PI) / 180;
+    const cos = Math.abs(Math.cos(rad));
+    const sin = Math.abs(Math.sin(rad));
+    const rw = Math.floor((sw * cos + sh * sin) * scale);
+    const rh = Math.floor((sw * sin + sh * cos) * scale);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, rw);
+    canvas.height = Math.max(1, rh);
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.rotate(rad);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, src.sx, src.sy, sw, sh, -sw / 2, -sh / 2, sw, sh);
+    ctx.restore();
+
+    // Boost contrast for faint serial numbers
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imageData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const v = g < 160 ? 0 : 255;
+      d[i] = d[i + 1] = d[i + 2] = v;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    return canvas.toDataURL('image/png');
+  }
+
+  async function ocrDigits(dataUrl, index, total, variant, variantTotal) {
     const { data } = await Tesseract.recognize(dataUrl, 'eng', {
       logger: (m) => {
         if (m.status === 'recognizing text' && m.progress != null) {
           const pct = Math.round(m.progress * 100);
-          setStatus(`OCR ${index}/${total}… ${pct}%`);
+          setStatus(
+            `OCR ${index}/${total} · var ${variant}/${variantTotal}… ${pct}%`
+          );
         }
       },
+      tessedit_char_whitelist: '0123456789ABOIlabcdefghijklmnopqrsuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
+      preserve_interword_spaces: '1',
     });
-    return pickHamarFromText((data && data.text) || '');
+    return (data && data.text) || '';
   }
 
   function pickHamarFromText(text) {
-    const cleaned = String(text).replace(/[Oo]/g, '0').replace(/[Il|]/g, '1');
-
-    const serial = cleaned.match(/\bA?\s*([0-9]{9,12})\b/i);
-    const nearHamar = cleaned.match(
-      /(?:Համար|Hamar|HAMAR|N[oо]?\.?|№)\s*[:#]?\s*([0-9]{8,12})/i
-    );
+    const cleaned = String(text)
+      .replace(/[Oo]/g, '0')
+      .replace(/[Il|]/g, '1')
+      .replace(/[Ss]/g, '5')
+      .replace(/[Bb](?=\d)/g, 'B')
+      .replace(/[Aa](?=\d)/g, 'A');
 
     const candidates = [];
-    if (nearHamar) candidates.push(nearHamar[1]);
-    if (serial) candidates.push(serial[1]);
-    for (const m of cleaned.matchAll(/\b([0-9]{10})\b/g)) {
-      candidates.push(m[1]);
+
+    // Corner serial: A7627426960 / B0897354074
+    for (const m of cleaned.matchAll(/\b([AB])\s*([0-9]{9,11})\b/gi)) {
+      const digits = m[2].replace(/\D/g, '');
+      if (digits.length >= 9 && digits.length <= 11) {
+        candidates.push({ value: normalizeHamar(digits), score: 100 });
+      }
     }
 
-    const ten = candidates.find((c) => c.length === 10);
-    if (ten) return ten;
-    if (candidates.length) {
-      return candidates.sort((a, b) => b.length - a.length)[0];
+    // Stuck together without space: A7627426960
+    for (const m of cleaned.matchAll(/([AB])([0-9]{9,11})/gi)) {
+      candidates.push({ value: normalizeHamar(m[2]), score: 95 });
     }
-    return null;
+
+    // Near label noise (OCR may mangled Համար)
+    for (const m of cleaned.matchAll(
+      /(?:Համար|Hamar|HAMAR|HAMAP|HAMA|N[oо°]?\.?|№|\[?\s*3\s*\]?)\s*[:#.\-_]?\s*([0-9]{8,12})/gi
+    )) {
+      candidates.push({ value: normalizeHamar(m[1]), score: 80 });
+    }
+
+    // Any 10-digit block
+    for (const m of cleaned.matchAll(/(?<!\d)([0-9]{10})(?!\d)/g)) {
+      const v = m[1];
+      // Prefer typical invoice numbers (often start with 0) over random IDs
+      let score = 40;
+      if (v.startsWith('0')) score = 55;
+      // Downrank common TIN-looking / bank-like if many zeros
+      if (/^0{2,}/.test(v) && v.endsWith('0000')) score = 10;
+      candidates.push({ value: v, score });
+    }
+
+    // 9–11 digit fallbacks
+    for (const m of cleaned.matchAll(/(?<!\d)([0-9]{9,11})(?!\d)/g)) {
+      candidates.push({ value: normalizeHamar(m[1]), score: 25 });
+    }
+
+    const filtered = candidates
+      .map((c) => ({ ...c, value: (c.value || '').replace(/\D/g, '') }))
+      .filter((c) => c.value.length >= 9 && c.value.length <= 11);
+
+    if (!filtered.length) return null;
+
+    filtered.sort((a, b) => b.score - a.score || b.value.length - a.value.length);
+    return filtered[0].value.length === 10
+      ? filtered[0].value
+      : normalizeHamar(filtered[0].value);
+  }
+
+  function normalizeHamar(digits) {
+    const d = String(digits).replace(/\D/g, '');
+    if (d.length === 10) return d;
+    if (d.length === 9) return `0${d}`;
+    if (d.length === 11 && d.startsWith('0')) return d.slice(0, 10);
+    if (d.length > 10) return d.slice(-10);
+    return d;
   }
 
   async function makeSinglePdf(dataUrl, filename) {
