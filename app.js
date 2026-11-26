@@ -36,7 +36,9 @@
       }
       if (!selected.length) throw new Error('Нет изображений в выборе');
       renderPreview();
-      setStatus(`Выбрано фото: ${selected.length}. Нажми «Сделать PDF».`);
+      setStatus(
+        `Выбрано фото: ${selected.length}. Нажми «Сделать PDF» — будет отдельный PDF на каждое.`
+      );
     } catch (err) {
       console.error(err);
       selected = [];
@@ -70,47 +72,65 @@
     if (!selected.length) return;
     setBusy(true);
 
-    try {
-      const pages = [];
-      const last4s = [];
+    const ok = [];
+    const fail = [];
 
+    try {
+      // Avoid browser blocking many downloads: small gap between saves
       for (let i = 0; i < selected.length; i++) {
         const item = selected[i];
         setStatus(`OCR ${i + 1}/${selected.length}: ${item.file.name}`);
-        const hamar = await extractHamar(item.dataUrl, i + 1, selected.length);
-        if (!hamar) {
-          throw new Error(
-            `Не найден Համար на фото ${i + 1} (${item.file.name}). Нужен более чёткий снимок.`
+
+        try {
+          const hamar = await extractHamar(item.dataUrl, i + 1, selected.length);
+          if (!hamar) {
+            throw new Error('Համար не найден');
+          }
+          const last4 = hamar.slice(-4);
+          const filename = uniqueFilename(last4, ok);
+          setStatus(
+            `PDF ${i + 1}/${selected.length}: Համար ${hamar} → ${filename}`
           );
+          await makeSinglePdf(item.dataUrl, filename);
+          ok.push({ filename, hamar, last4 });
+          await sleep(350);
+        } catch (err) {
+          console.error(item.file.name, err);
+          fail.push({
+            name: item.file.name,
+            reason: err.message || String(err),
+          });
         }
-        const last4 = hamar.slice(-4);
-        last4s.push(last4);
-        pages.push({ dataUrl: item.dataUrl, hamar, last4 });
-        setStatus(
-          `OCR ${i + 1}/${selected.length}: Համար ${hamar} → ${last4}`
-        );
       }
 
-      const filename = buildFilename(last4s);
-      setStatus(`Собираю PDF (${pages.length} стр.) → ${filename}`);
-      await makeMultiPagePdf(pages, filename);
-
-      const list = pages.map((p, i) => `${i + 1}) ${p.hamar} → ${p.last4}`).join('\n');
-      setStatus(`Готово: ${filename}\n${list}`, 'ok');
-    } catch (err) {
-      console.error(err);
-      setStatus(err.message || String(err), 'err');
+      const lines = [];
+      lines.push(`Готово PDF: ${ok.length} из ${selected.length}`);
+      for (const row of ok) {
+        lines.push(`✓ ${row.filename} (Համար ${row.hamar})`);
+      }
+      for (const row of fail) {
+        lines.push(`✗ ${row.name}: ${row.reason}`);
+      }
+      setStatus(lines.join('\n'), fail.length ? 'err' : 'ok');
     } finally {
       setBusy(false);
     }
   }
 
-  function buildFilename(last4s) {
-    const unique = [...new Set(last4s)];
-    if (unique.length === 1) return `${unique[0]}.pdf`;
-    // keep order of first appearance, limit length
-    const joined = unique.slice(0, 6).join('_');
-    return `${joined}.pdf`;
+  /** If two invoices share same last4, use 2815.pdf, 2815_2.pdf, … */
+  function uniqueFilename(last4, alreadyOk) {
+    const used = new Set(alreadyOk.map((r) => r.filename));
+    let name = `${last4}.pdf`;
+    let n = 2;
+    while (used.has(name)) {
+      name = `${last4}_${n}.pdf`;
+      n += 1;
+    }
+    return name;
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function readAsDataURL(file) {
@@ -157,35 +177,24 @@
     return null;
   }
 
-  async function makeMultiPagePdf(pages, filename) {
+  async function makeSinglePdf(dataUrl, filename) {
     const { jsPDF } = window.jspdf;
-    let pdf = null;
+    const img = await loadImage(dataUrl);
+    const orientation = img.width >= img.height ? 'landscape' : 'portrait';
+    const pdf = new jsPDF({ orientation, unit: 'mm', format: 'a4' });
 
-    for (let i = 0; i < pages.length; i++) {
-      const dataUrl = pages[i].dataUrl;
-      const img = await loadImage(dataUrl);
-      const orientation = img.width >= img.height ? 'landscape' : 'portrait';
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const margin = 6;
+    const maxW = pageW - margin * 2;
+    const maxH = pageH - margin * 2;
+    const scale = Math.min(maxW / img.width, maxH / img.height);
+    const w = img.width * scale;
+    const h = img.height * scale;
+    const x = (pageW - w) / 2;
+    const y = (pageH - h) / 2;
 
-      if (!pdf) {
-        pdf = new jsPDF({ orientation, unit: 'mm', format: 'a4' });
-      } else {
-        pdf.addPage('a4', orientation);
-      }
-
-      const pageW = pdf.internal.pageSize.getWidth();
-      const pageH = pdf.internal.pageSize.getHeight();
-      const margin = 6;
-      const maxW = pageW - margin * 2;
-      const maxH = pageH - margin * 2;
-      const scale = Math.min(maxW / img.width, maxH / img.height);
-      const w = img.width * scale;
-      const h = img.height * scale;
-      const x = (pageW - w) / 2;
-      const y = (pageH - h) / 2;
-
-      pdf.addImage(dataUrl, guessImageFormat(dataUrl), x, y, w, h);
-    }
-
+    pdf.addImage(dataUrl, guessImageFormat(dataUrl), x, y, w, h);
     pdf.save(filename);
   }
 
